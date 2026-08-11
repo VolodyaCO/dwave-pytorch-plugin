@@ -15,13 +15,13 @@
 import unittest
 
 import torch
-from dimod import SPIN, BinaryQuadraticModel, IdentitySampler, SampleSet, TrackingComposite
-from parameterized import parameterized
+import numpy as np
+from dimod import IdentitySampler, SampleSet, TrackingComposite, SPIN
 
 from dwave.plugins.torch.models.boltzmann_machine import GraphRestrictedBoltzmannMachine as GRBM
 from dwave.plugins.torch.samplers.dimod_sampler import DimodSampler
 from dwave.samplers import SteepestDescentSampler
-from dwave.system.temperatures import maximum_pseudolikelihood_temperature as mple
+from dwave.samplers import SimulatedAnnealingSampler
 
 
 class TestDimodSampler(unittest.TestCase):
@@ -92,6 +92,7 @@ class TestDimodSampler(unittest.TestCase):
                 torch.tensor(list(tracker.input['h'].values())),
                 torch.tensor([0, 0, 0, 0.0])
             )
+
         with self.subTest("Linear weights should be clipped to be within range."):
             grbm.linear.data[:] = torch.tensor([-2, -0.002, 0.002, 3])
             tracker = TrackingComposite(SteepestDescentSampler())
@@ -103,6 +104,7 @@ class TestDimodSampler(unittest.TestCase):
                 torch.tensor(list(tracker.input['h'].values())),
                 torch.tensor([-1, -0.2, 0.2, 1])
             )
+
         with self.subTest("Quadratic weights should be clipped to be within range."):
             grbm.quadratic.data[:] = torch.tensor([-2, -0.002, 0.002, 3])
             tracker = TrackingComposite(SteepestDescentSampler())
@@ -114,6 +116,7 @@ class TestDimodSampler(unittest.TestCase):
                 torch.tensor(list(tracker.input['J'].values())),
                 torch.tensor([-1, -0.2, 0.2, 1])
             )
+
         with self.subTest("Quadratic weights should be clipped to be 0."):
             grbm.quadratic.data[:] = torch.tensor([-2, -0.002, 0.002, 3])
             tracker = TrackingComposite(SteepestDescentSampler())
@@ -125,6 +128,247 @@ class TestDimodSampler(unittest.TestCase):
                 torch.tensor(list(tracker.input['J'].values())),
                 torch.tensor([0, 0, 0, 0.0])
             )
+
+        sampler = DimodSampler(
+            self.bm,
+            SimulatedAnnealingSampler(),
+            prefactor=1,
+            sample_kwargs=dict(num_reads=1)
+        )
+
+        x = torch.tensor([
+            [1.0, float("nan"), -1.0, float("nan")],
+            [float("nan"), -1.0, float("nan"), 1.0],
+        ])
+
+        samples = sampler.sample(x)
+
+        with self.subTest("Conditional sampling returns expected shape"):
+            # Shape check
+            self.assertTupleEqual(samples.shape, (2, 1, 4))
+        samples = samples.squeeze()
+
+        with self.subTest("Conditional sampling preserves clamped variables"):
+            # Check clamped values unchanged
+            mask = ~torch.isnan(x)
+            self.assertTrue(torch.all(samples[mask] == x[mask]))
+
+        with self.subTest("Conditional sampling samples free variables as ±1"):
+            # Check free variables are ±1
+            free_mask = torch.isnan(x)
+            free_values = samples[free_mask]
+            self.assertTrue(torch.all(torch.isin(free_values, torch.tensor([-1.0, 1.0]))),
+                            "Free variables should be sampled as ±1")
+
+        with self.subTest("Conditional sampling supports multiple reads."):
+            num_reads = 5
+            sampler = DimodSampler(
+                self.bm,
+                SimulatedAnnealingSampler(),
+                prefactor=1,
+                sample_kwargs=dict(num_reads=num_reads)
+            )
+
+            x = torch.tensor([
+                [1.0, float("nan"), -1.0, float("nan")],
+                [float("nan"), -1.0, float("nan"), 1.0],
+            ])
+
+            samples = sampler.sample(x)
+
+            # Shape should be (batch_size, num_reads, n_nodes)
+            self.assertTupleEqual(samples.shape, (2, 5, 4))
+
+            # Check clamped values for every read
+            mask = ~torch.isnan(x)
+            free_mask = torch.isnan(x)
+            for i in range(num_reads):
+                self.assertTrue(torch.all(samples[:, i, :][mask] == x[mask]))
+
+                free_values = samples[:, i, :][free_mask]
+                self.assertTrue(torch.all(torch.isin(free_values, torch.tensor([-1.0, 1.0]))),
+                                f"Free variables should be sampled as ±1 in read {i}")
+
+        with self.subTest("Conditional sampling with all variables clamped returns input unchanged."):
+            num_reads = 5
+            sampler = DimodSampler(
+                self.bm,
+                SimulatedAnnealingSampler(),
+                prefactor=1,
+                sample_kwargs=dict(num_reads=num_reads)
+            )
+
+            x = torch.tensor([
+                [+1.0, -1.0, -1.0, +1.0],
+                [-1.0, +1.0, -1.0, -1.0],
+            ])
+
+            samples = sampler.sample(x)
+            for i in range(num_reads):
+                torch.testing.assert_close(
+                    samples[:, i, :],
+                    x,
+                    msg=f"Fully clamped inputs should be preserved in read {i}"
+                )
+
+        with self.subTest("Conditional sampling supports mixed fully clamped and partially clamped rows."):
+            num_reads = 5
+            sampler = DimodSampler(
+                self.bm,
+                SimulatedAnnealingSampler(),
+                prefactor=1,
+                sample_kwargs=dict(num_reads=num_reads)
+            )
+
+            x = torch.tensor([
+                [1.0, -1.0, -1.0,  1.0],          # fully clamped
+                [-1.0, float("nan"), 1.0, -1.0],  # partially clamped
+            ])
+
+            samples = sampler.sample(x)
+
+            # First row fully clamped, should be preserved
+            for i in range(num_reads):
+                torch.testing.assert_close(
+                    samples[0, i, :],
+                    x[0],
+                    msg=f"Fully clamped row should be preserved in read {i}"
+                )
+
+            # Clamped values in the second row should be preserved
+            self.assertTrue(torch.all(samples[1, :, 0] == -1))
+            self.assertTrue(torch.all(samples[1, :, 2] == 1))
+            self.assertTrue(torch.all(samples[1, :, 3] == -1))
+
+        with self.subTest("Conditional sampling rejects invalid input shape."):
+            sampler = DimodSampler(
+                self.bm,
+                SimulatedAnnealingSampler(),
+                prefactor=1,
+                sample_kwargs=dict(num_reads=1)
+            )
+            
+            x = torch.ones((2, self.n - 1))  # 3 columns instead of 4
+
+            with self.assertRaisesRegex(ValueError, "x must have shape"):
+                sampler.sample(x)
+
+        with self.subTest("Conditional sampling rejects invalid spin values."):
+            sampler = DimodSampler(
+                self.bm,
+                SimulatedAnnealingSampler(),
+                prefactor=1,
+                sample_kwargs=dict(num_reads=1)
+            )
+
+            x = torch.tensor([
+                [1.0, 0.0, -1.0, float("nan")]
+            ])
+
+            with self.assertRaisesRegex(ValueError, "x must contain only ±1 or NaN"):
+                sampler.sample(x)
+        
+        with self.subTest("Conditional sampling clips linear biases of free variables."):
+            # Make the linear biases large enough that clipping must occur.
+            self.bm.linear.data = torch.tensor([100.0, -100.0, 2.0, -2.0])
+            self.bm.quadratic.data.zero_()
+
+            tracker = TrackingComposite(SteepestDescentSampler())
+            sampler = DimodSampler(
+                self.bm,
+                tracker,
+                prefactor=1,
+                linear_range=[-1, 1],
+                quadratic_range=None,
+                sample_kwargs=dict(),
+            )
+
+            # Keep d and b free; clamp a and c.
+            x = torch.tensor([
+                [float("nan"), float("nan"), 1.0, -1.0]
+            ])
+
+            sampler.sample(x)
+
+            bqm = tracker.input["bqm"]
+            self.assertEqual(bqm.get_linear("d"), 1.0)
+            self.assertEqual(bqm.get_linear("b"), -1.0)
+            
+        with self.subTest("Conditional sampling clips linear biases after conditioning."):
+            # Start with linear biases already inside the allowed range.
+            self.bm.linear.data = torch.tensor([0.0, 0.0, 0.0, 0.0])
+
+            # Make one coupling large enough that fixing a variable pushes a
+            # remaining linear bias outside the allowed range.
+            #
+            # Edge order is:
+            # (a,b), (a,c), (a,d), (b,c)
+            self.bm.quadratic.data = torch.tensor([10.0, 0.0, 0.0, 0.0])
+
+            tracker = TrackingComposite(SteepestDescentSampler())
+            sampler = DimodSampler(
+                self.bm,
+                tracker,
+                prefactor=1,
+                linear_range=[-1, 1],
+                quadratic_range=None,
+                sample_kwargs=dict(),
+            )
+
+            # Node order is d, b, a, c.
+            # Fix a=+1. Variables b, c, d remain free.
+            x = torch.tensor([
+                [float("nan"), float("nan"), 1.0, float("nan")]
+            ])
+
+            sampler.sample(x)
+
+            bqm = tracker.input["bqm"]
+
+            # Conditioning would make the linear bias on b equal to +10,
+            # so it should be clipped back to +1.
+            self.assertEqual(bqm.get_linear("b"), 1.0)
+        
+        with self.subTest("Conditional sampling rejects inconsistent sample shapes."):
+            class InconsistentReadSampler:
+                def __init__(self):
+                    self.calls = 0
+
+                def sample(self, bqm, **kwargs):
+                    self.calls += 1
+
+                    # Intentionally return different numbers of reads
+                    # for different conditional rows.
+                    num_reads = 5 if self.calls == 1 else 3
+
+                    samples = [
+                        {v: 1 for v in bqm.variables}
+                        for _ in range(num_reads)
+                    ]
+
+                    return SampleSet.from_samples(
+                        samples,
+                        vartype=SPIN,
+                        energy=[0.0] * num_reads,
+                    )
+
+            sampler = DimodSampler(
+                self.bm,
+                InconsistentReadSampler(),
+                prefactor=1,
+                sample_kwargs=dict(),
+            )
+
+            x = torch.tensor([
+                [1.0, float("nan"), -1.0, float("nan")],
+                [float("nan"), -1.0, float("nan"), 1.0],
+            ])
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "Expected all samples to have shape"
+            ):
+                sampler.sample(x)
 
     def test_sample_set(self):
         grbm = GRBM(list("abcd"), [("a", "b")])

@@ -30,6 +30,7 @@ import warnings
 from typing import TYPE_CHECKING, Hashable, Iterable, Literal, Optional, Union, overload
 
 import torch
+from einops import reduce
 
 if TYPE_CHECKING:
     from dimod import Sampler, SampleSet
@@ -123,6 +124,12 @@ class GraphRestrictedBoltzmannMachine(torch.nn.Module):
         self._linear = torch.nn.Parameter(torch.zeros(self._n_nodes))
         self._quadratic = torch.nn.Parameter(quadratic_init)
 
+        if (edge_idx_i == edge_idx_j).any():
+            loop_indices = edge_idx_i[(edge_idx_i == edge_idx_j).argwhere()].tolist()
+            raise ValueError(
+                f"Self-loops are not allowed. Edge indices with self-loops: {loop_indices}"
+            )
+
         self.register_buffer("_edge_idx_i", edge_idx_i)
         self.register_buffer("_edge_idx_j", edge_idx_j)
 
@@ -170,11 +177,6 @@ class GraphRestrictedBoltzmannMachine(torch.nn.Module):
         self._connected_hidden = any(
             a in self.hidden_nodes and b in self.hidden_nodes for a, b in self.edges
         )
-        if self._connected_hidden:
-            err_message = (
-                "Current implementation does not support intrahidden-unit connections."
-            )
-            raise NotImplementedError(err_message)
 
         visible_idx = torch.tensor(
             [self._node_to_idx[v] for v in self._nodes if v not in self.hidden_nodes],
@@ -350,8 +352,7 @@ class GraphRestrictedBoltzmannMachine(torch.nn.Module):
         warnings.warn(
             f"`{self.__class__}.sample()()` is deprecated since dwave-pytorch-plugin "
             "0.3.0 and will be removed in 0.4.0. Use Use `dwave.plugins.torch.samplers` module "
-            "for all sampling-related tasks instead."
-            , DeprecationWarning
+            "for all sampling-related tasks instead.", DeprecationWarning
         )
 
         if sample_params is None:
@@ -382,8 +383,7 @@ class GraphRestrictedBoltzmannMachine(torch.nn.Module):
         warnings.warn(
             f"`{self.__class__}.sampleset_to_tensor()` is deprecated since dwave-pytorch-plugin "
             "0.3.0 and will be removed in 0.4.0. Use Use `dwave.plugins.torch.samplers` module "
-            "for all sampling-related tasks instead."
-            , DeprecationWarning
+            "for all sampling-related tasks instead.", DeprecationWarning
         )
 
         return sampleset_to_tensor(self._nodes, sample_set, device)
@@ -408,12 +408,12 @@ class GraphRestrictedBoltzmannMachine(torch.nn.Module):
                 (b1, N) where b1 denotes the batch size and N denotes the number of
                 variables in the model.
             s_model (torch.Tensor): Tensor of spins drawn from the model with shape
-                (b2, N) where b2 denotes the batch size and N denotse the number of
+                (b2, N) where b2 denotes the batch size and N denotes the number of
                 variables in the model.
             kind (Literal["sampling", "exact-disc"]): Method for computing, or approximating,
                 marginal expectations given partial observations.
                 The "sampling" method samples, conditionally, for each observation.
-                The "exact-disc" method computes exact margnials for when hidden units are
+                The "exact-disc" method computes exact marginals for when hidden units are
                 disconnected, i.e., no connections between hidden units.
             prefactor (float, optional): A scaling applied to the Hamiltonian weights (linear and
                 quadratic weights). When None, no scaling is applied. Defaults to None.
@@ -452,7 +452,7 @@ class GraphRestrictedBoltzmannMachine(torch.nn.Module):
                 # the sufficient statistics, which is then passed into the quasi objective function.
                 obs = self._compute_expectation_disconnected(s_observed)
             elif kind == "sampling":
-                obs = self._approximate_expectation_sampling(
+                obs = self._conditional_hidden_sampling(
                     s_observed, sampler, prefactor, linear_range, quadratic_range, sample_kwargs
                 )
             else:
@@ -464,7 +464,7 @@ class GraphRestrictedBoltzmannMachine(torch.nn.Module):
                 raise ValueError(
                     f"`kind` {kind} should not be specified if the model is fully visible.")
         return (
-            self.sufficient_statistics(obs).mean(0, True)
+            reduce(self.sufficient_statistics(obs), "... n -> n", "mean")
             - self.sufficient_statistics(s_model).mean(0, True)
         ) @ self.theta
 
@@ -499,7 +499,7 @@ class GraphRestrictedBoltzmannMachine(torch.nn.Module):
 
         return h_eff
 
-    def _approximate_expectation_sampling(
+    def _conditional_hidden_sampling(
         self,
         obs: torch.Tensor,
         sampler: Sampler,
@@ -508,7 +508,7 @@ class GraphRestrictedBoltzmannMachine(torch.nn.Module):
         quadratic_range: Optional[tuple[float, float]] = None,
         sample_kwargs: Optional[dict] = None,
     ) -> torch.Tensor:
-        """Approximate expectation of hidden units via sampling.
+        """Fill hidden units via conditional sampling.
 
         This is a computationally expensive method as it requires performing sampling for every
         observation in ``obs``.
@@ -527,8 +527,9 @@ class GraphRestrictedBoltzmannMachine(torch.nn.Module):
             sample_kwargs (dict, optional): Sample kwargs for ``sampler``. Defaults to None.
 
         Returns:
-            torch.Tensor: A tensor of shape (b, N) where N is the total number of variables in the
-            model, i.e., number of hidden and visible units and number of visible units.
+            torch.Tensor: A tensor of shape (b, M, N) where N is the total number of variables in the
+            model, i.e., number of hidden and visible units and number of visible units and M is the
+            number of samples drawn for each observation.
         """
         # Create the BQM and remove visible units
         bqm = BinaryQuadraticModel.from_ising(
@@ -566,13 +567,13 @@ class GraphRestrictedBoltzmannMachine(torch.nn.Module):
             # Sample from conditional distribution
             sample_set = sampler.sample(bqm, **sample_kwargs)
             # Populate the hidden indices with the average
-            avg = torch.tensor(sample_set.record.sample).float().mean(0)
-            for idx_avg, node in enumerate(sample_set.variables):
+            hiddens = torch.tensor(sample_set.record.sample).float()  # shape (n_samples, n_hidden)
+            spins = torch.tensor(spins).unsqueeze(0).repeat(hiddens.shape[0], 1).float()
+            for idx_hiddens, node in enumerate(sample_set.variables):
                 idx = self.node_to_idx[node]
-                spins[idx] = avg[idx_avg]
+                spins[:, idx] = hiddens[:, idx_hiddens]
             res.append(spins)
-
-        return torch.tensor(res, device=obs.device)
+        return torch.stack(res).to(obs.device)
 
     def _compute_expectation_disconnected(self, obs: torch.Tensor) -> torch.Tensor:
         """Compute and return the conditional expectation of spins including observed
