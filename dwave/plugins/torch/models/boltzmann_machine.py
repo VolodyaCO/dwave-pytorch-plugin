@@ -103,10 +103,8 @@ class GraphRestrictedBoltzmannMachine(torch.nn.Module):
         self._idx_to_edge = {i: e for i, e in enumerate(self._edges)}
         self._edge_to_idx = {e: i for i, e in self._idx_to_edge.items()}
 
-        edge_idx_i = torch.tensor([self._node_to_idx[i] for i, _ in self._edges], dtype=torch.long)
-        edge_idx_j = torch.tensor(
-            [self._node_to_idx[j] for _, j in self._edges], dtype=torch.long
-        )
+        edge_idx_i = torch.tensor([self._node_to_idx[i] for i, _ in self._edges])
+        edge_idx_j = torch.tensor([self._node_to_idx[j] for _, j in self._edges])
 
         degrees = torch.zeros(self._n_nodes)
         for i, j in zip(edge_idx_i, edge_idx_j):
