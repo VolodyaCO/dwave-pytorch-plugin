@@ -78,11 +78,12 @@ class TestDiscreteVariationalAutoencoder(unittest.TestCase):
         # are the models themselves
         latent_dims_list = [1, 2]
         self.encoders = {i: Encoder(i) for i in latent_dims_list}
-        # self.decoders is independent of number of latent dims, but we also create a dict to
-        # separate them
+        # self.decoders is independent of number of latent dims, but we also create a dict to separate
+        # them
         self.decoders = {i: Decoder(latent_features, input_features) for i in latent_dims_list}
-        # self.dvaes is a dict whose keys are the numbers of latent dims and the values are the
-        # models themselves
+
+        # self.dvaes is a dict whose keys are the numbers of latent dims and the values are the models
+        # themselves
 
         self.dvaes = {i: DVAE(self.encoders[i], self.decoders[i]) for i in latent_dims_list}
 
