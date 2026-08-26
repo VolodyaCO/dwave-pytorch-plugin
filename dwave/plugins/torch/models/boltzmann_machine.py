@@ -47,7 +47,6 @@ spread = AggregatedSamples.spread
 __all__ = ["GraphRestrictedBoltzmannMachine"]
 
 
-
 class GraphRestrictedBoltzmannMachine(torch.nn.Module):
     """Creates a graph-restricted Boltzmann machine.
 
