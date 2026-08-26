@@ -95,10 +95,12 @@ class TestGraphRestrictedBoltzmannMachine(unittest.TestCase):
 
     def test_custom_quadratic_overrides_default_initialization(self):
         bm = GRBM(
-            ["a", "b", "c"], [("a", "b"), ("b", "c")], quadratic={("b", "c"): 1.25}
+                ["a", "b", "c"], [("a", "b"), ("b", "c")], quadratic={("b", "c"): 1.25},
+                linear={"a": 0.2},
         )
 
         self.assertAlmostEqual(1.25, bm.quadratic[1].item())
+        self.assertAlmostEqual(0.2, bm.linear[0].item())
 
     def test_selfloop(self):
         # Create a triangle graph with an additional dangling vertex
